@@ -12,18 +12,13 @@ def root():
 @app.post("/upload-csv")
 async def upload_csv(file: UploadFile):
     contents = await file.read()
-
     df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
-
-    # delete later, prints read status of books in list
-    # print(df['Exclusive Shelf'].tolist())
-
-
     # contains 'read' books
     read_df = df[df['Exclusive Shelf'].str.lower() == 'read']
-
     total_read = get_total_read(read_df)
+    
     print(read_df)
+    
     return {
         "total_read": total_read
     }

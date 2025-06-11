@@ -13,4 +13,4 @@ def test_get_total_read():
         )
     assert response.status_code == 200
     json_data = response.json()
-    print(json_data)
+    assert json_data["total_read"] == 16
