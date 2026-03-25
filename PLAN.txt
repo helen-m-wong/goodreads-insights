@@ -1,0 +1,323 @@
+# Goodreads Insights Web App — Project Plan
+
+## Context
+Build a full-stack web app to analyze a Goodreads library export CSV and display reading insights visually. The user is building this to learn SQL and AI/NLP. Stack: FastAPI (Python) + PostgreSQL + React. Single-user, no auth. Possible Azure deployment. Mobile-responsive UI with a share/export feature.
+
+---
+
+## CSV Structure (confirmed)
+Key columns from `goodreads_library_export.csv`:
+- `Book Id`, `Title`, `Author`, `Additional Authors`
+- `ISBN`, `ISBN13`
+- `My Rating` (0-5), `Average Rating`
+- `Publisher`
+- `Number of Pages` -- used for pace + longest/shortest. Goodreads exports the edition's page count;
+  Kindle editions use a normalized estimate (~266 words/Kindle location). All 319 rows in sample
+  have values, none zero. Small variance vs. print is acceptable for trend analysis.
+- `Binding` -- NOT USED (not everyone marks format; inconsistent)
+- `Year Published`, `Original Publication Year`
+- `Date Read`, `Date Added`
+- `Bookshelves` -- NOT USED FOR GENRE (inconsistent across users)
+- `Exclusive Shelf` (read / to-read / currently-reading)
+- `My Review`, `Read Count`, `Owned Copies`
+
+Genre source: Fetched from external APIs post-upload using ISBN:
+- Primary: Google Books API -- https://www.googleapis.com/books/v1/volumes?q=isbn:{isbn}
+  -> `categories` field (clean high-level genres, no key needed)
+- Fallback: Open Library API -- https://openlibrary.org/api/books?bibkeys=ISBN:{isbn}&format=json&jscmd=data
+  -> `subjects` field (also used for book covers)
+
+---
+
+## AI Approach
+Use Gemini Flash (cheapest tier, free: 15 RPM / 1M TPD) + aggressive DB caching.
+Generate AI content ONCE per upload, store in DB, serve cached on subsequent visits.
+No per-book API calls. HuggingFace runs on-server (free, no per-call cost).
+
+---
+
+## Planned Insights
+
+| Insight                      | SQL Concept Learned                      |
+|------------------------------|------------------------------------------|
+| Books read per year          | GROUP BY, COUNT, date functions          |
+| Average rating per year/genre| AVG, GROUP BY multiple columns           |
+| Genre breakdown (pie/bar)    | Many-to-many join, COUNT                 |
+| Reading pace (pages/month)   | SUM, date arithmetic                     |
+| Top authors by books read    | GROUP BY, ORDER BY, LIMIT                |
+| Re-read books                | WHERE Read_Count > 1                     |
+| Longest vs shortest books    | MIN, MAX                                 |
+| Month-by-month reading       | EXTRACT(MONTH), heatmap                  |
+
+---
+
+## Architecture
+
+goodreads-insights/
+├── backend/
+│   ├── app/
+│   │   ├── main.py              # FastAPI app entry point
+│   │   ├── database.py          # SQLAlchemy engine + session
+│   │   ├── config.py            # Settings via .env
+│   │   ├── models/
+│   │   │   └── book.py          # SQLAlchemy ORM models
+│   │   ├── schemas/
+│   │   │   └── book.py          # Pydantic request/response schemas
+│   │   ├── routers/
+│   │   │   ├── upload.py        # POST /upload endpoint
+│   │   │   ├── insights.py      # GET /insights/* endpoints
+│   │   │   └── ai.py            # GET /ai/* endpoints
+│   │   └── services/
+│   │       ├── csv_parser.py    # Pandas CSV cleaning + normalization
+│   │       ├── genre_service.py # Google Books + Open Library ISBN lookup
+│   │       ├── insights.py      # SQL query functions (learning SQL here)
+│   │       └── ai_service.py    # Gemini Flash + HuggingFace calls
+│   ├── .env
+│   └── requirements.txt
+├── frontend/
+│   ├── src/
+│   │   ├── components/
+│   │   │   ├── FileUpload.tsx
+│   │   │   ├── Dashboard.tsx
+│   │   │   ├── charts/
+│   │   │   │   ├── BooksPerYear.tsx
+│   │   │   │   ├── GenreChart.tsx
+│   │   │   │   ├── RatingDistribution.tsx
+│   │   │   │   ├── ReadingHeatmap.tsx
+│   │   │   │   └── TopAuthors.tsx
+│   │   │   ├── AIReaderSummary.tsx
+│   │   │   ├── AIRecommendations.tsx
+│   │   │   └── ShareButton.tsx
+│   │   ├── api.ts               # Typed fetch wrapper
+│   │   └── App.tsx
+└── goodreads_library_export.csv
+
+---
+
+## Database Schema
+
+-- books table
+CREATE TABLE books (
+    id                SERIAL PRIMARY KEY,
+    goodreads_id      INTEGER UNIQUE,
+    title             TEXT NOT NULL,
+    author            TEXT,
+    additional_authors TEXT,
+    isbn              TEXT,
+    my_rating         SMALLINT,           -- 0 = not rated
+    avg_rating        NUMERIC(3,2),
+    publisher         TEXT,
+    num_pages         INTEGER,
+    year_published    SMALLINT,
+    original_pub_year SMALLINT,
+    date_read         DATE,
+    date_added        DATE,
+    exclusive_shelf   TEXT,               -- 'read', 'to-read', 'currently-reading'
+    my_review         TEXT,
+    read_count        SMALLINT DEFAULT 1,
+    owned_copies      SMALLINT DEFAULT 0
+);
+
+-- genres (fetched from Google Books / Open Library by ISBN after upload)
+CREATE TABLE genres (
+    id    SERIAL PRIMARY KEY,
+    name  TEXT UNIQUE NOT NULL            -- e.g. 'Fantasy', 'Fiction', 'Romance'
+);
+
+-- many-to-many
+CREATE TABLE book_genres (
+    book_id   INTEGER REFERENCES books(id) ON DELETE CASCADE,
+    genre_id  INTEGER REFERENCES genres(id) ON DELETE CASCADE,
+    PRIMARY KEY (book_id, genre_id)
+);
+
+-- AI reader summary cache
+CREATE TABLE reader_summary (
+    id           SERIAL PRIMARY KEY,
+    library_hash TEXT UNIQUE,             -- hash of library state
+    summary_text TEXT,
+    created_at   TIMESTAMP DEFAULT NOW()
+);
+
+---
+
+## Build Phases
+
+### Phase 1 -- Database & Backend Foundation
+Goal: PostgreSQL running, FastAPI connected, models defined
+
+1. Create PostgreSQL database (goodreads_db) locally
+2. Write backend/app/database.py -- SQLAlchemy async engine
+3. Write backend/app/models/book.py -- ORM models matching schema above
+4. Write backend/app/main.py -- FastAPI app with CORS
+5. Run Alembic migrations to create tables
+6. Add .env with DATABASE_URL, GEMINI_API_KEY
+
+SQL learned: CREATE TABLE, PRIMARY KEY, FOREIGN KEY, ON DELETE CASCADE
+
+---
+
+### Phase 2 -- CSV Upload & Parsing
+Goal: Upload CSV -> clean data with Pandas -> insert into PostgreSQL -> kick off genre enrichment
+
+1. backend/app/services/csv_parser.py:
+   - Read CSV with Pandas
+   - Clean: strip ISBN formatting (="..." -> clean string), parse dates, handle missing ratings
+   - Bookshelves column ignored for genres
+   - Return structured list of dicts
+2. backend/app/routers/upload.py -- POST /upload accepts multipart file
+3. Upsert books into DB (handle re-uploads gracefully)
+4. After insert, trigger background task (fastapi.BackgroundTasks) to fetch genres per book via ISBN
+
+SQL learned: INSERT ... ON CONFLICT DO UPDATE (upsert), bulk insert patterns
+
+### Phase 2b -- Genre Enrichment Service
+Goal: Async ISBN -> genre lookup, stored relationally
+
+1. backend/app/services/genre_service.py:
+   - fetch_genres_for_book(isbn: str) -> list[str]
+   - Try Google Books first -> volumeInfo.categories
+   - Fallback to Open Library -> subjects[].name
+   - Normalize: title-case, deduplicate, filter noise
+   - Skip if book already has genres in DB (idempotent on re-upload)
+2. Upsert into genres + book_genres tables
+3. If ISBN is missing for a book, skip gracefully
+
+SQL learned: INSERT ... ON CONFLICT DO NOTHING, multi-table upsert pattern
+
+---
+
+### Phase 3 -- Insights API
+Goal: Raw SQL queries returning JSON data for charts
+
+Write query functions in backend/app/services/insights.py using SQLAlchemy Core (raw SQL):
+
+- GET /insights/books-per-year    -- COUNT by year from date_read
+- GET /insights/genres            -- JOIN books -> book_genres -> genres, COUNT per genre
+- GET /insights/ratings           -- distribution of my_rating values
+- GET /insights/top-authors       -- GROUP BY author, COUNT DESC LIMIT 10
+- GET /insights/reading-pace      -- SUM(num_pages) GROUP BY year/month
+- GET /insights/heatmap           -- books per month, all years (calendar heatmap)
+- GET /insights/summary           -- aggregate stats: total books, total pages, avg rating
+
+SQL learned: GROUP BY, COUNT, SUM, AVG, ORDER BY, LIMIT, EXTRACT, JOIN, WHERE
+
+---
+
+### Phase 4 -- React Frontend & Charts
+Goal: Beautiful, mobile-responsive dashboard
+
+Tech choices:
+- Vite + React + TypeScript -- fast dev setup
+- Tailwind CSS -- utility-first, easy mobile responsiveness
+- Recharts -- React-native compatible charting library
+- React Query -- for data fetching and caching
+
+Components to build:
+1. FileUpload -- drag-and-drop CSV uploader with progress indicator
+2. Dashboard -- grid layout that adapts from 1-col (mobile) to 3-col (desktop)
+3. Chart components: BarChart (books/year), PieChart (genres), LineChart (pace), Heatmap
+4. Stats cards: total books, pages, avg rating, reading streak
+5. AIReaderSummary -- whimsical reader personality card at top of dashboard
+
+Design direction: Clean, soft aesthetic -- muted colors, rounded cards, subtle shadows. Book-themed but modern.
+
+---
+
+### Phase 5 -- AI Features
+Goal: Low-cost AI features safe for public deployment
+
+Cost strategy: Gemini Flash + aggressive DB caching. One generation per upload, cached in DB.
+
+#### 5a. "What kind of reader are you?" blurb (Gemini Flash)
+- GET /ai/reader-summary -- one call per library upload
+- Input: top genres, avg rating, books/year, favourite authors, re-read count, longest book read
+- Example: "You're a voracious romantic at heart -- devouring fantasy worlds by night and
+  swooning over slow-burn romances by day."
+- Cache in reader_summary table (keyed by hash of library); regenerate only on new upload
+- UI: highlight card at top of dashboard, also included in share PNG
+
+AI learned: Prompt engineering, context window design, caching strategy
+
+#### 5b. Book recommendations (Gemini Flash)
+- POST /ai/recommendations -- sends top-rated books + top genres to Gemini Flash
+- Returns 5 personalized recommendations with reasons
+- Cached in DB; UI: card list with book cover via Open Library (free, no key)
+- Regenerated only on new upload
+
+AI learned: Few-shot prompting, structured output parsing
+
+#### 5c. NLP -- Review sentiment (Hugging Face, free, runs on server)
+- Use transformers sentiment pipeline on user reviews -> "mood over time" line chart
+- Zero API cost, runs on server
+- Only processes reviews that exist (skip blanks)
+
+NLP concepts learned: Tokenization, sentiment classification pipelines
+
+---
+
+### Phase 6 -- Share / Export Feature
+Goal: Generate a shareable PNG summary card
+
+- PNG only: use html2canvas in browser to capture a dedicated summary card component -> download
+- Summary card includes: total books read, top genres, avg rating, reader-type blurb, year badge
+- Example: "Helen read 47 books in 2025 * Top genres: Fantasy, Romance * Avg rating: 4.2"
+- No server-side generation (no reportlab dependency)
+
+---
+
+### Phase 7 -- Azure Deployment (optional, later phase)
+Goal: Deploy to Azure for public/mobile access
+
+- Backend: Azure App Service (Python) or Azure Container Apps
+- Frontend: Azure Static Web Apps (free tier, CDN-backed)
+- Database: Azure Database for PostgreSQL Flexible Server
+- Env secrets: Azure Key Vault or App Service environment variables
+- CI/CD: GitHub Actions -> auto-deploy on push to main
+
+---
+
+## Required Packages
+
+### Backend (requirements.txt)
+alembic              # DB migrations
+google-generativeai  # Gemini Flash API
+transformers         # HuggingFace sentiment NLP
+torch                # Required by transformers (CPU-only is fine)
+python-multipart     # File upload support in FastAPI
+httpx                # Async HTTP (Google Books + Open Library API calls)
+
+Note: sentence-transformers removed (embeddings descoped).
+      reportlab removed (PDF replaced by client-side PNG).
+
+### Frontend (npm)
+react + vite + typescript
+tailwindcss
+recharts
+@tanstack/react-query
+html2canvas
+axios
+
+---
+
+## Verification / Testing Plan
+
+1. Phase 1: uvicorn app.main:app --reload -> visit http://localhost:8000/docs
+2. Phase 2: Upload CSV via Swagger UI -> verify rows in PostgreSQL with psql;
+   check genre enrichment: SELECT g.name, COUNT(*) FROM book_genres bg
+   JOIN genres g ON bg.genre_id = g.id GROUP BY g.name;
+3. Phase 3: Hit each /insights/* endpoint in Swagger -> inspect JSON
+4. Phase 4: npm run dev -> upload CSV -> verify all charts render with real data
+5. Phase 5: Trigger /ai/reader-summary -> read blurb in UI; verify recommendations
+6. Phase 6: Click share button -> verify PNG downloads correctly
+
+---
+
+## Critical Files to Create First
+1. backend/app/main.py
+2. backend/app/database.py
+3. backend/app/models/book.py -- includes Genre + BookGenre models
+4. backend/app/services/csv_parser.py
+5. backend/app/services/genre_service.py -- Google Books + Open Library ISBN lookup
+6. backend/app/routers/upload.py -- triggers genre enrichment as background task
+7. frontend/ -- init with Vite (npm create vite@latest frontend -- --template react-ts)

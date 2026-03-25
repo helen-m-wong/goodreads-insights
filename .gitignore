@@ -216,3 +216,6 @@ build/
 .DS_Store
 
 .vscode/
+
+# Personal Goodreads export — contains private reading history
+goodreads_library_export.csv
